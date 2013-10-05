@@ -60,11 +60,14 @@ struct gpio_desc {
 #define FLAG_ACTIVE_LOW	7	/* sysfs value has active low */
 #define FLAG_OPEN_DRAIN	8	/* Gpio is open drain type */
 #define FLAG_OPEN_SOURCE 9	/* Gpio is open source type */
+#define FLAG_PULL_UP	 10	/* internally pulled-up */
+#define FLAG_PULL_DOWN	 11	/* internally pulled-down */
 
 #define ID_SHIFT	16	/* add new flags before this one */
 
 #define GPIO_FLAGS_MASK		((1 << ID_SHIFT) - 1)
 #define GPIO_TRIGGER_MASK	(BIT(FLAG_TRIG_FALL) | BIT(FLAG_TRIG_RISE))
+#define GPIO_PULLUD_MASK	(BIT(FLAG_PULL_UP) | BIT(FLAG_PULL_DOWN))
 
 #ifdef CONFIG_DEBUG_FS
 	const char		*label;
@@ -264,6 +267,62 @@ static ssize_t gpio_direction_store(struct device *dev,
 
 static /* const */ DEVICE_ATTR(direction, 0644,
 		gpio_direction_show, gpio_direction_store);
+
+static ssize_t gpio_pullud_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	const struct gpio_desc	*desc = dev_get_drvdata(dev);
+	ssize_t			status;
+
+	mutex_lock(&sysfs_lock);
+
+	if (!test_bit(FLAG_EXPORT, &desc->flags))
+		status = -EIO;
+	else {
+		const char *s;
+		switch (desc->flags & GPIO_PULLUD_MASK) {
+		case BIT(FLAG_PULL_UP):
+			s = "up";
+			break;
+		case BIT(FLAG_PULL_DOWN):
+			s = "down";
+			break;
+		default:
+			s = "none";
+			break;
+		}
+		status = sprintf("%s\n", s);
+	}
+
+	mutex_unlock(&sysfs_lock);
+	return status;
+}
+
+static ssize_t gpio_pullud_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct gpio_desc	*desc = dev_get_drvdata(dev);
+	unsigned		gpio = desc - gpio_desc;
+	ssize_t			status;
+
+	mutex_lock(&sysfs_lock);
+
+	if (!test_bit(FLAG_EXPORT, &desc->flags))
+		status = -EIO;
+	else if (sysfs_streq(buf, "up"))
+		status = gpio_pullud(gpio, 1);
+	else if (sysfs_streq(buf, "down"))
+		status = gpio_pullud(gpio, 0);
+	else if (sysfs_streq(buf, "none"))
+		status = gpio_pullud(gpio, -1);
+	else
+		status = -EINVAL;
+
+	mutex_unlock(&sysfs_lock);
+	return status ? : size;
+}
+
+static const DEVICE_ATTR(pullud, 0644, gpio_pullud_show, gpio_pullud_store);
 
 static ssize_t gpio_value_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
@@ -744,6 +803,10 @@ int gpio_export(unsigned gpio, bool direction_may_change)
 			if (!status && direction_may_change)
 				status = device_create_file(dev,
 						&dev_attr_direction);
+
+			if (!status)
+				status = device_create_file(dev,
+						&dev_attr_pullud);
 
 			if (!status && gpio_to_irq(gpio) >= 0
 					&& (direction_may_change
@@ -1557,6 +1620,65 @@ fail:
 	return status;
 }
 EXPORT_SYMBOL_GPL(gpio_set_debounce);
+
+/**
+ * gpio_pullud - sets/unsets pullup/down function for @gpio according to @value
+ * @gpio: the gpio to set pullup/down
+ * @value: 0 to pulldown
+ *         1 to pullup
+ *         others to disable
+ */
+int gpio_pullud(unsigned gpio, int value)
+{
+	unsigned long		flags;
+	struct gpio_chip	*chip;
+	struct gpio_desc	*desc = &gpio_desc[gpio];
+	int			status = -EINVAL;
+
+	spin_lock_irqsave(&gpio_lock, flags);
+
+	if (!gpio_is_valid(gpio))
+		goto fail;
+	chip = desc->chip;
+	if (!chip || !chip->pullud)
+		goto fail;
+	gpio -= chip->base;
+	if (gpio >= chip->ngpio)
+		goto fail;
+	status = gpio_ensure_requested(desc, gpio);
+	if (status < 0)
+		goto fail;
+
+	/* now we know the gpio is valid and chip won't vanish */
+
+	spin_unlock_irqrestore(&gpio_lock, flags);
+
+	might_sleep_if(chip->can_sleep);
+
+	/* REVISIT: need to make sure the gpio line is input? */
+	status = chip->pullud(chip, gpio, value);
+	if (!status) {
+		desc->flags &= ~GPIO_PULLUD_MASK;
+		switch (value) {
+		case 0:
+			set_bit(FLAG_PULL_DOWN, &desc->flags);
+			break;
+		case 1:
+			set_bit(FLAG_PULL_UP, &desc->flags);
+			break;
+		}
+	}
+	return status;
+
+fail:
+	spin_unlock_irqrestore(&gpio_lock, flags);
+	if (status)
+		pr_debug("%s: gpio-%d status %d\n",
+			__func__, gpio, status);
+
+	return status;
+}
+EXPORT_SYMBOL_GPL(gpio_pullud);
 
 /* I/O calls are only valid after configuration completed; the relevant
  * "is this a valid GPIO" error checks should already have been done.
