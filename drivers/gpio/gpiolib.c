@@ -60,11 +60,14 @@ struct gpio_desc {
 #define FLAG_ACTIVE_LOW	6	/* sysfs value has active low */
 #define FLAG_OPEN_DRAIN	7	/* Gpio is open drain type */
 #define FLAG_OPEN_SOURCE 8	/* Gpio is open source type */
+#define FLAG_PULL_UP	 9	/* internally pulled-up */
+#define FLAG_PULL_DOWN	 10	/* internally pulled-down */
 
 #define ID_SHIFT	16	/* add new flags before this one */
 
 #define GPIO_FLAGS_MASK		((1 << ID_SHIFT) - 1)
 #define GPIO_TRIGGER_MASK	(BIT(FLAG_TRIG_FALL) | BIT(FLAG_TRIG_RISE))
+#define GPIO_PULLUD_MASK	(BIT(FLAG_PULL_UP) | BIT(FLAG_PULL_DOWN))
 
 #ifdef CONFIG_DEBUG_FS
 	const char		*label;
@@ -90,6 +93,7 @@ static int gpiod_direction_input(struct gpio_desc *desc);
 static int gpiod_direction_output(struct gpio_desc *desc, int value);
 static int gpiod_get_direction(const struct gpio_desc *desc);
 static int gpiod_set_debounce(struct gpio_desc *desc, unsigned debounce);
+static int gpiod_pullud(struct gpio_desc *desc, int value);
 static int gpiod_get_value_cansleep(const struct gpio_desc *desc);
 static void gpiod_set_value_cansleep(struct gpio_desc *desc, int value);
 static int gpiod_get_value(const struct gpio_desc *desc);
@@ -309,6 +313,61 @@ static ssize_t gpio_direction_store(struct device *dev,
 
 static /* const */ DEVICE_ATTR(direction, 0644,
 		gpio_direction_show, gpio_direction_store);
+
+static ssize_t gpio_pullud_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	const struct gpio_desc	*desc = dev_get_drvdata(dev);
+	ssize_t			status;
+
+	mutex_lock(&sysfs_lock);
+
+	if (!test_bit(FLAG_EXPORT, &desc->flags))
+		status = -EIO;
+	else {
+		const char *s;
+		switch (desc->flags & GPIO_PULLUD_MASK) {
+		case BIT(FLAG_PULL_UP):
+			s = "up";
+			break;
+		case BIT(FLAG_PULL_DOWN):
+			s = "down";
+			break;
+		default:
+			s = "none";
+			break;
+		}
+		status = sprintf("%s\n", s);
+	}
+
+	mutex_unlock(&sysfs_lock);
+	return status;
+}
+
+static ssize_t gpio_pullud_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct gpio_desc	*desc = dev_get_drvdata(dev);
+	ssize_t			status;
+
+	mutex_lock(&sysfs_lock);
+
+	if (!test_bit(FLAG_EXPORT, &desc->flags))
+		status = -EIO;
+	else if (sysfs_streq(buf, "up"))
+		status = gpiod_pullud(gpio_desc, 1);
+	else if (sysfs_streq(buf, "down"))
+		status = gpiod_pullud(gpio_desc, 0);
+	else if (sysfs_streq(buf, "none"))
+		status = gpiod_pullud(gpio_desc, -1);
+	else
+		status = -EINVAL;
+
+	mutex_unlock(&sysfs_lock);
+	return status ? : size;
+}
+
+static const DEVICE_ATTR(pullud, 0644, gpio_pullud_show, gpio_pullud_store);
 
 static ssize_t gpio_value_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
@@ -808,6 +867,10 @@ static int gpiod_export(struct gpio_desc *desc, bool direction_may_change)
 		if (status)
 			goto fail_unregister_device;
 	}
+
+	status = device_create_file(dev, &dev_attr_pullud);
+	if (status)
+		goto fail_unregister_device;
 
 	if (gpiod_to_irq(desc) >= 0 && (direction_may_change ||
 				       !test_bit(FLAG_IS_OUT, &desc->flags))) {
@@ -1803,6 +1866,67 @@ int gpio_set_debounce(unsigned gpio, unsigned debounce)
 	return gpiod_set_debounce(gpio_to_desc(gpio), debounce);
 }
 EXPORT_SYMBOL_GPL(gpio_set_debounce);
+
+/**
+ * gpio_pullud - sets/unsets pullup/down function for @gpio according to @value
+ * @gpio: the gpio to set pullup/down
+ * @value: 0 to pulldown
+ *         1 to pullup
+ *         others to disable
+ */
+int gpiod_pullud(struct gpio_desc *desc, int value)
+{
+	unsigned long		flags;
+	struct gpio_chip	*chip;
+	int			status = -EINVAL;
+	int			offset;
+
+	spin_lock_irqsave(&gpio_lock, flags);
+
+	chip = desc->chip;
+	if (!chip || !chip->pullud)
+		goto fail;
+
+	status = gpio_ensure_requested(desc);
+	if (status < 0)
+		goto fail;
+
+	/* now we know the gpio is valid and chip won't vanish */
+
+	spin_unlock_irqrestore(&gpio_lock, flags);
+
+	might_sleep_if(chip->can_sleep);
+
+	/* REVISIT: need to make sure the gpio line is input? */
+	offset = gpio_chip_hwgpio(desc);
+	status = chip->pullud(chip, offset, value);
+	if (!status) {
+		desc->flags &= ~GPIO_PULLUD_MASK;
+		switch (value) {
+		case 0:
+			set_bit(FLAG_PULL_DOWN, &desc->flags);
+			break;
+		case 1:
+			set_bit(FLAG_PULL_UP, &desc->flags);
+			break;
+		}
+	}
+	return status;
+
+fail:
+	spin_unlock_irqrestore(&gpio_lock, flags);
+	if (status)
+		pr_debug("%s: gpio-%d status %d\n", __func__,
+			 desc_to_gpio(desc), status);
+
+	return status;
+}
+
+int gpio_pullud(unsigned gpio, int value)
+{
+	return gpiod_pullud(gpio_to_desc(gpio), value);
+}
+EXPORT_SYMBOL_GPL(gpio_pullud);
 
 /* I/O calls are only valid after configuration completed; the relevant
  * "is this a valid GPIO" error checks should already have been done.
