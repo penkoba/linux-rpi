@@ -19,6 +19,7 @@
 #include <mach/gpio.h>
 #include <linux/gpio.h>
 #include <linux/platform_device.h>
+#include <linux/delay.h>
 #include <mach/platform.h>
 
 #define BCM_GPIO_DRIVER_NAME "bcm2708_gpio"
@@ -99,6 +100,30 @@ static int bcm2708_gpio_dir_out(struct gpio_chip *gc, unsigned offset,
 	if (ret >= 0)
 		bcm2708_gpio_set(gc, offset, value);
 	return ret;
+}
+
+static int bcm2708_gpio_pullud(struct gpio_chip *gc, unsigned offset, int value)
+{
+	struct bcm2708_gpio *gpio = container_of(gc, struct bcm2708_gpio, gc);
+	unsigned gpio_bank = offset / 32;
+	unsigned gpio_field_offset = (offset - 32 * gpio_bank);
+	printk(DRIVER_NAME ": %s %p (%d=%d)\n", __func__, gc, offset, value);
+	if (offset >= ARCH_NR_GPIOS)
+		return -EINVAL;
+	if (value == 0)		/* pull down */
+		writel(1, gpio->base + GPIOUD);
+	else if (value == 1)	/* pull up */
+		writel(2, gpio->base + GPIOUD);
+	else			/* off */
+		writel(0, gpio->base + GPIOUD);
+	udelay(5);
+	writel(1 << gpio_field_offset, gpio->base + GPIOUDCLK(gpio_bank));
+	udelay(5);
+	writel(0, gpio->base + GPIOUD);
+	udelay(5);
+	writel(0, gpio->base + GPIOUDCLK(gpio_bank));
+
+	return 0;
 }
 
 static int bcm2708_gpio_get(struct gpio_chip *gc, unsigned offset)
@@ -285,6 +310,7 @@ static int bcm2708_gpio_probe(struct platform_device *dev)
 
 	ucb->gc.direction_input = bcm2708_gpio_dir_in;
 	ucb->gc.direction_output = bcm2708_gpio_dir_out;
+	ucb->gc.pullud = bcm2708_gpio_pullud;
 	ucb->gc.get = bcm2708_gpio_get;
 	ucb->gc.set = bcm2708_gpio_set;
 	ucb->gc.can_sleep = 0;
