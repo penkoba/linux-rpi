@@ -36,7 +36,7 @@
 #define GPIOLEN(x)   (0x70+(x)*4)
 #define GPIOAREN(x)  (0x7c+(x)*4)
 #define GPIOAFEN(x)  (0x88+(x)*4)
-#define GPIOUD(x)    (0x94+(x)*4)
+#define GPIOUD       0x94
 #define GPIOUDCLK(x) (0x98+(x)*4)
 
 enum { GPIO_FSEL_INPUT, GPIO_FSEL_OUTPUT,
